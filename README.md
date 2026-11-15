@@ -1,5 +1,7 @@
 # PDF2EPUB 📚
 
+This version is published by [Bilal Bayrakdar](https://github.com/Bilallbayrakdar). It originates from [overcuriousity/pdf2epub](https://github.com/overcuriousity/pdf2epub), and the original MIT copyright stays in [LICENSE](LICENSE).
+
 Convert PDF files to nicely structured Markdown and EPUB format with intelligent layout detection.
 
 ## ✨ Features
@@ -182,7 +184,7 @@ Please ensure your code follows the existing style and includes appropriate test
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/overcuriousity/pdf2epub.git
+git clone https://github.com/Bilallbayrakdar/pdf2epub.git
 cd pdf2epub
 ```
 
