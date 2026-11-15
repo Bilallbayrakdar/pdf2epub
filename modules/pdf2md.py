@@ -74,6 +74,7 @@ def save_images(images: dict, image_dir: Path) -> None:
     else:
         print("No valid images were found to save")
 
+# @start PDF-MD-CONV
 def convert_pdf(
     input_path: str,
     output_dir: Path,
@@ -106,7 +107,14 @@ def convert_pdf(
         converter = PdfConverter(config=config, artifact_dict=models)
         rendered = converter(input_path)
 
-        full_text = rendered.markdown
+        from modules.glyph_repair import repair_markdown
+
+        full_text, repair = repair_markdown(input_path, rendered.markdown)
+        print(
+            f"Glyph repair: {repair.lines} line(s), "
+            f"{len(repair.replaced)} word(s) replaced, "
+            f"{len(repair.unresolved)} unresolved"
+        )
         images = rendered.images
         metadata = rendered.metadata
 
@@ -144,8 +152,10 @@ def convert_pdf(
     except Exception as e:
         print(f"Error converting {input_path}: {str(e)}", file=sys.stderr)
         raise
+# @end PDF-MD-CONV
 
     
+# @start PDF-MD-QUEUE
 def add_pdfs_to_queue(input_path: Path) -> list[Path]:
     """
     Add PDF files to the processing queue.
@@ -170,3 +180,4 @@ def add_pdfs_to_queue(input_path: Path) -> list[Path]:
         queue.append(input_path)
         
     return queue
+# @end PDF-MD-QUEUE

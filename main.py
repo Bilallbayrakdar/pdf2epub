@@ -8,6 +8,7 @@ import torch
                 
 
 
+# @start PDF-MD-RUN
 def main():
     if torch.cuda.is_available():
         print("CUDA is available. Using GPU for processing.")
@@ -52,6 +53,11 @@ def main():
         '--skip-md',
         action='store_true',
         help='Skip markdown generation, use existing markdown files'
+    )
+    parser.add_argument(
+        '--non-interactive',
+        action='store_true',
+        help='Accept default EPUB metadata and skip the markdown review prompt'
     )
     
     args = parser.parse_args()
@@ -98,7 +104,11 @@ def main():
             # Convert Markdown to EPUB unless skipped
             if not args.skip_epub:
                 print("Converting Markdown to EPUB...")
-                mark2epub.convert_to_epub(markdown_dir, output_path)
+                mark2epub.convert_to_epub(
+                    markdown_dir,
+                    output_path,
+                    interactive=not args.non_interactive,
+                )
                 
         except Exception as e:
             print(f"Error processing {pdf_path.name}: {str(e)}", file=sys.stderr)
@@ -113,6 +123,7 @@ def main():
         for name in failed:
             print(f"  - {name}", file=sys.stderr)
         sys.exit(1)
+# @end PDF-MD-RUN
 
 if __name__ == '__main__':
     main()

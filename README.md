@@ -135,6 +135,7 @@ Options:
   --start-page INT         Page number to start from
   --skip-epub              Skip EPUB generation, only create markdown
   --skip-md                Skip markdown generation, use existing markdown files
+  --non-interactive        Accept default EPUB metadata and skip the review prompt
 ```
 
 If `input_path` is omitted, all PDFs in `./input/` are processed.
