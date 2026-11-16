@@ -2,9 +2,16 @@ import re
 from difflib import SequenceMatcher
 from typing import NamedTuple
 
-_TRANS = str.maketrans(
+_FUZZY = str.maketrans(
     {
         "ı": "i", "İ": "i", "I": "i", "l": "i", "1": "i", "0": "o",
+        "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g", "ü": "u", "Ü": "u",
+        "ö": "o", "Ö": "o", "ç": "c", "Ç": "c", "â": "a", "î": "i", "û": "u",
+    }
+)
+_SLUG = str.maketrans(
+    {
+        "ı": "i", "İ": "i", "I": "i",
         "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g", "ü": "u", "Ü": "u",
         "ö": "o", "Ö": "o", "ç": "c", "Ç": "c", "â": "a", "î": "i", "û": "u",
     }
@@ -21,10 +28,16 @@ class TocEntry(NamedTuple):
     href: str = ""
 
 
+def _slug(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[*_`·]+", "", text)
+    return re.sub(r"[^a-z]", "", text.translate(_SLUG).lower())
+
+
 def _key(text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"[*_`]+", "", text)
-    return re.sub(r"[^a-z]", "", text.translate(_TRANS).lower())
+    text = re.sub(r"[*_`·]+", "", text)
+    return re.sub(r"[^a-z]", "", text.translate(_FUZZY).lower())
 
 
 def _label(text: str) -> str:
@@ -45,7 +58,7 @@ def link_contents(markdown: str) -> tuple[str, list[TocEntry]]:
         (
             i
             for i, line in enumerate(lines)
-            if (m := _HEADING.match(line)) and _key(m.group(2)) == "icindekiler"
+            if (m := _HEADING.match(line)) and _slug(m.group(2)) == "icindekiler"
         ),
         None,
     )
@@ -70,7 +83,7 @@ def link_contents(markdown: str) -> tuple[str, list[TocEntry]]:
             else:
                 bits.append((i, title, "", 1))
         elif line.startswith("|") and not re.match(r"^\|\s*-+", line):
-            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            cells = [_label(c) for c in line.strip().strip("|").split("|")]
             if cells and cells[0] and not set(cells[0]) <= {"-", ":", " "}:
                 page = re.sub(r"[^\d]", "", cells[1] if len(cells) > 1 else "")
                 bits.append((i, cells[0], page, 1 if not page else 2))
@@ -135,6 +148,10 @@ def link_contents(markdown: str) -> tuple[str, list[TocEntry]]:
                 f"- {_link(label, anchor)}" + (f", {page}" if page else "")
                 for label, page, _level, anchor in group
             )
+
+    for i in range(start, end):
+        if lines[i].startswith("|"):
+            lines[i] = re.sub(r"<br\s*/?>", " ", lines[i], flags=re.I)
 
     return "\n".join(lines) + ("\n" if markdown.endswith("\n") else ""), entries
 

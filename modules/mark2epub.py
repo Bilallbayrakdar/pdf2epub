@@ -53,6 +53,46 @@ def get_metadata_from_user(existing_metadata: Optional[Dict] = None, interactive
         "chapters": existing_metadata.get("chapters", []),
         "cover_image": existing_metadata.get("cover_image", None)
     }
+
+
+_PLACEHOLDER_TITLE = frozenset({"", "Untitled Document", "Untitled"})
+_PLACEHOLDER_CREATOR = frozenset({"", "Unknown Author", "Unknown"})
+
+
+def infer_epub_metadata(work_dir: Path, data: dict) -> dict:
+    """Fill generic dc:* fields from markdown headings or the folder name."""
+    meta = dict(data.get("metadata") or {})
+    need_title = meta.get("dc:title", "Untitled Document") in _PLACEHOLDER_TITLE
+    need_creator = meta.get("dc:creator", "Unknown Author") in _PLACEHOLDER_CREATOR
+    if not (need_title or need_creator):
+        return data
+
+    skip = {"icindekiler", "önsöz", "onsöz", "içindekiler"}
+    headings: list[str] = []
+    for md in sorted(work_dir.glob("*.md")):
+        for line in md.read_text(encoding="utf-8").splitlines()[:50]:
+            m = re.match(r"^#\s+(.+?)\s*$", line.strip())
+            if not m:
+                continue
+            t = m.group(1).strip("*")
+            if _slug := re.sub(r"\s+", " ", t):
+                if _slug.casefold() not in skip and len(_slug) > 1:
+                    headings.append(_slug)
+        if headings:
+            break
+
+    if need_title:
+        meta["dc:title"] = (
+            f"{headings[0]} – {headings[1]}" if len(headings) >= 2 else headings[0]
+            if headings else work_dir.name
+        )
+    if need_creator and headings:
+        meta["dc:creator"] = headings[0]
+    if meta.get("dc:language") == "en" and re.search(r"[İığüşöçĞÜŞÖÇ]", work_dir.name + meta.get("dc:title", "")):
+        meta["dc:language"] = "tr"
+    return {**data, "metadata": meta}
+
+
 # @end MD-EPUB-META
 
 # @start MD-EPUB-REVIEW
@@ -490,6 +530,12 @@ def get_chapter_XML(work_dir: str, md_filename: str, css_filenames: list[str], c
     
     # Process markdown for images and get list of referenced images
     markdown_data, chapter_images = process_markdown_for_images(markdown_data, work_dir_path)
+    markdown_data = re.sub(
+        r"^#{4,6}(\s+(?:[IVXLC\d]+|\d+)\.\s+Bölüm)\s*$",
+        r"##\1",
+        markdown_data,
+        flags=re.M,
+    )
     markdown_data, toc_entries = link_contents(markdown_data)
     
     # Convert to HTML
@@ -552,7 +598,10 @@ def main(args, interactive: bool = True):
         if os.path.exists(description_path):
             with open(description_path, 'r', encoding='utf-8') as f:
                 existing_metadata = json.load(f)
-        
+
+        if not interactive:
+            existing_metadata = infer_epub_metadata(Path(work_dir), existing_metadata)
+
         # Get metadata from user
         json_data = get_metadata_from_user(existing_metadata, interactive=interactive)
         
@@ -731,6 +780,11 @@ def main(args, interactive: bool = True):
             # Copy CSS files; write a default style.css for any that are missing
             default_css_content = b"""body { font-family: serif; line-height: 1.5; margin: 5%; }
 h1, h2, h3, h4, h5, h6 { font-family: sans-serif; }
+h1 { font-size: 1.6em; margin-top: 1.2em; }
+h2 { font-size: 1.35em; margin-top: 1em; }
+h3, h4 { font-size: 1.2em; margin-top: 0.8em; }
+#icindekiler table { border-collapse: collapse; width: 100%; margin: 0.5em 0; }
+#icindekiler td, #icindekiler th { padding: 0.2em 0.5em; vertical-align: top; }
 img { max-width: 100%; height: auto; }
 pre, code { font-family: monospace; font-size: 0.9em; }
 """

@@ -141,6 +141,13 @@ def _font_name(tp, idx, buf):
 
 def _scan_pdf(pdf_path):
     pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        return _scan_pdf_open(pdf)
+    finally:
+        pdf.close()
+
+
+def _scan_pdf_open(pdf):
     buf = ctypes.create_string_buffer(128)
     raw_lines, font_counts = [], Counter()
 
@@ -305,26 +312,29 @@ def _recognize_jobs(pdf_path, jobs):
     miss_idx = [i for i, k in enumerate(keys) if k not in cache]
     if miss_idx:
         pdf = pdfium.PdfDocument(pdf_path)
-        miss_imgs = [pdf[jobs[i].page_idx].render(scale=4, crop=jobs[i].crop_box).to_pil().convert("RGB") for i in miss_idx]
-        onnx_res = _onnx_recognize(miss_imgs)
-        surya_todo = []
-        for i, (txt, conf) in zip(miss_idx, onnx_res):
-            if _needs_surya(jobs[i], txt, conf):
-                surya_todo.append((i, pdf[jobs[i].page_idx].render(scale=5, crop=jobs[i].crop_box).to_pil().convert("RGB")))
-            else:
-                cache[keys[i]] = txt
-        if surya_todo:
-            from surya.foundation import FoundationPredictor
-            from surya.recognition import RecognitionPredictor
+        try:
+            miss_imgs = [pdf[jobs[i].page_idx].render(scale=4, crop=jobs[i].crop_box).to_pil().convert("RGB") for i in miss_idx]
+            onnx_res = _onnx_recognize(miss_imgs)
+            surya_todo = []
+            for i, (txt, conf) in zip(miss_idx, onnx_res):
+                if _needs_surya(jobs[i], txt, conf):
+                    surya_todo.append((i, pdf[jobs[i].page_idx].render(scale=5, crop=jobs[i].crop_box).to_pil().convert("RGB")))
+                else:
+                    cache[keys[i]] = txt
+            if surya_todo:
+                from surya.foundation import FoundationPredictor
+                from surya.recognition import RecognitionPredictor
 
-            rec = RecognitionPredictor(FoundationPredictor())
-            for s in range(0, len(surya_todo), 16):
-                chunk = surya_todo[s:s + 16]
-                preds = rec([im for _, im in chunk], bboxes=[[[0, 0, im.width, im.height]] for _, im in chunk])
-                for (i, _), pred in zip(chunk, preds):
-                    cache[keys[i]] = " ".join(ln.text for ln in pred.text_lines).strip()
-                _CACHE.write_text(json.dumps(cache, ensure_ascii=False))
-        _CACHE.write_text(json.dumps(cache, ensure_ascii=False))
+                rec = RecognitionPredictor(FoundationPredictor())
+                for s in range(0, len(surya_todo), 16):
+                    chunk = surya_todo[s:s + 16]
+                    preds = rec([im for _, im in chunk], bboxes=[[[0, 0, im.width, im.height]] for _, im in chunk])
+                    for (i, _), pred in zip(chunk, preds):
+                        cache[keys[i]] = " ".join(ln.text for ln in pred.text_lines).strip()
+                    _CACHE.write_text(json.dumps(cache, ensure_ascii=False))
+            _CACHE.write_text(json.dumps(cache, ensure_ascii=False))
+        finally:
+            pdf.close()
     return [_norm_ocr(cache[k]) for k in keys]
 
 
