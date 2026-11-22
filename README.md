@@ -7,23 +7,37 @@ Convert PDF files to nicely structured Markdown and EPUB format with intelligent
 ## ✨ Features
 
 - 📖 Smart layout detection for books and academic papers
-- 🔍 Advanced text extraction and OCR capabilities
-- 📊 Table detection and formatting
+- 🔍 Hybrid text extraction with targeted line-level OCR glyph repair
+- 📊 Table detection, clickable Table of Contents linking, and verse line-number alignment
 - 🖼️ Image extraction and optimization
-- 📝 Clean markdown output with preserved structure
-- 📱 EPUB generation with customizable styling
+- 📝 Clean Markdown & EPUB 3 output with semantic footnotes and normalized headings
+- 📱 Validated XHTML packaging with customizable styling and automatic metadata inference
 - 🌍 Multi-language support
-- 🚀 GPU acceleration support (NVIDIA & AMD)
-- 🍎 Apple Silicon support
+- 🚀 GPU acceleration support (NVIDIA, AMD & Apple Silicon)
+
+## What This Version Adds
+
+- **Targeted Corrupt-Glyph Repair (`modules/glyph_repair.py`):** Detects broken ClearScan or subset-font encodings on specific PDF lines (for example, `sabanmı` -> `sabanını` or `açıkIar` -> `açıklar`) and splices line-level PP-OCRv5 (`onnxruntime`) corrections without re-OCRing clean pages.
+- **EPUB 3 Footnotes & Page-Break Rejoining (`modules/structure_norm.py`):** Locates bottom-of-page footnote rules in the PDF (including unnumbered ClearScan notes and multi-page continuations), converts them into per-chapter `1..N` EPUB 3 `noteref` / `<aside epub:type="footnote">` notes for tap-to-popup readers, and rejoins sentences or hyphenated words split across footnote zones:
+  ```text
+  PDF page bottom: "...olay" + [footnote rule + note] + next page: "içinde olay..."
+  EPUB output:     "...olay içinde olay..." + linked chapter-end <aside> footnote
+  ```
+- **Chapter Spines & Clickable Table of Contents (`modules/contents_toc.py`):** Splits books into per-chapter XHTML spines and aligns printed TOC tables (*Contents* / *İçindekiler*) to target chapters via dynamic programming so both in-page TOC rows and the EPUB reader drawer are clickable.
+- **Heading & Back-Cover Normalization (`modules/structure_norm.py`):** Normalizes inconsistent OCR subheading levels inside each chapter (`<h1>` chapter title with uniform `<h2>`/`<h3>` subsections), demotes misclassified quoted dialogue or glossary cross-references (`Bkz.`) to paragraphs, and isolates trailing back-cover blurbs onto a separate page.
+- **Verse Line-Number Formatting (`modules/verse_lineno.py`):** Detects margin line numbers in poetic works (`5, 10, 15...`) and formats them as aligned margin labels (`span.verse-ln`) instead of numbers glued into verse text.
+- **Entity Sanitization & Strict XHTML Gate (`modules/md_sanitize.py`, `modules/xhtml_gate.py`):** Repairs split `marker-pdf` HTML entities (`<sup>&#</sup>x27;` -> `'`) and unclosed inline tags, guards against duplicated body prose across spines, and validates/repairs every `.xhtml`, `.opf`, and `.ncx` file with `lxml` before writing the `.epub`.
 
 ## 🛠️ Dependencies
 
 - Python 3.10–3.14 (3.13 recommended, see below)
-- PyTorch (with CUDA/ROCm support for GPU acceleration)
+- PyTorch (with CUDA/ROCm/MPS support for GPU acceleration)
 - marker-pdf==1.10.2
 - transformers==4.57.6
 - markdown==3.10.2
 - latex2mathml==3.81.0
+- lxml==6.1.3
+- onnxruntime==1.32.0
 
 ### ⚠️ Python version
 
@@ -102,10 +116,9 @@ docker run -it --rm \
   pdf2epub input.pdf
 ```
 
-`-it` is required for EPUB generation because metadata is prompted
-interactively; with `--skip-epub` it can run non-interactively.
+`-it` is used when prompting interactively for EPUB metadata; pass `--non-interactive` (or `--skip-epub`) for unattended runs.
 
-Tagged releases are also published to
+Tagged releases of the upstream project are published to
 `ghcr.io/overcuriousity/pdf2epub` by the Docker workflow.
 
 ## 🚀 Usage
@@ -117,15 +130,19 @@ Convert a single PDF file:
 python main.py input.pdf
 ```
 
+Convert unattended (auto-inferring title, author, and language without prompts):
+```bash
+python main.py input.pdf --non-interactive
+```
+
 Convert all PDFs in a directory:
 ```bash
 python main.py input_directory/
 ```
 
-EPUB generation prompts interactively for metadata (title, author, language,
-and so on; press Enter to accept each default). It therefore needs a terminal —
-run it non-interactively and it will fail with `EOFError`. Use `--skip-epub` to
-produce only markdown without any prompts.
+By default, EPUB generation prompts interactively for metadata (press Enter to
+accept inferred defaults). Use `--non-interactive` to accept inferred metadata
+automatically in scripts/CI, or `--skip-epub` to produce only Markdown.
 
 ### Advanced Options
 
