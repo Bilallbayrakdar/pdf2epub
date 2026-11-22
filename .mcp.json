@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "anchor-map": {
+      "command": "python",
+      "args": ["anchor_map/server.py"]
+    }
+  }
+}

@@ -1,5 +1,7 @@
 # PDF2EPUB 📚
 
+This version is published by [Bilal Bayrakdar](https://github.com/Bilallbayrakdar). It originates from [overcuriousity/pdf2epub](https://github.com/overcuriousity/pdf2epub), and the original MIT copyright stays in [LICENSE](LICENSE).
+
 Convert PDF files to nicely structured Markdown and EPUB format with intelligent layout detection.
 
 ## ✨ Features
@@ -135,6 +137,7 @@ Options:
   --start-page INT         Page number to start from
   --skip-epub              Skip EPUB generation, only create markdown
   --skip-md                Skip markdown generation, use existing markdown files
+  --non-interactive        Accept default EPUB metadata and skip the review prompt
 ```
 
 If `input_path` is omitted, all PDFs in `./input/` are processed.
@@ -181,7 +184,7 @@ Please ensure your code follows the existing style and includes appropriate test
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/overcuriousity/pdf2epub.git
+git clone https://github.com/Bilallbayrakdar/pdf2epub.git
 cd pdf2epub
 ```
 

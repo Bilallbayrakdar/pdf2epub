@@ -1,5 +1,8 @@
+import html as std_html
+import html.parser as std_htmlparser
 import markdown
 import os
+from collections import Counter
 from xml.dom import minidom
 import zipfile
 import sys
@@ -9,24 +12,39 @@ import regex as re
 from pathlib import Path
 from datetime import datetime, timezone
 import subprocess
-from typing import Dict, Optional
+from typing import Dict, NamedTuple, Optional
 from urllib.parse import quote
 from xml.sax.saxutils import escape as xml_escape
 import latex2mathml.converter
+from lxml import html as lxml_html
+from markdown.htmlparser import HTMLExtractor
+from markdown.preprocessors import Preprocessor
+from modules.contents_toc import TocEntry, link_contents, nest_entries
+from modules.md_sanitize import sanitize_marker_markdown
+from modules.structure_norm import (
+    normalize_footnotes_and_breaks,
+    normalize_heading_hierarchy,
+    resolve_pdf_path,
+    upgrade_footnotes_to_epub3,
+)
+from modules.verse_lineno import format_verse_line_numbers
+from modules.xhtml_gate import ensure_xhtml, ensure_xml
 
 def get_user_input(prompt: str, default: str = "") -> str:
     """Get user input with a default value."""
     user_input = input(f"{prompt} [{default}]: ").strip()
     return user_input if user_input else default
 
-def get_metadata_from_user(existing_metadata: Optional[Dict] = None) -> Dict:
-    """Interactively collect metadata from user with defaults from existing metadata."""
+# @start MD-EPUB-META
+def get_metadata_from_user(existing_metadata: Optional[Dict] = None, interactive: bool = True) -> Dict:
+    """Collect metadata from prompts, or keep defaults when non-interactive."""
     if existing_metadata is None:
         existing_metadata = {}
     
     metadata = existing_metadata.get("metadata", {})
     
-    print("\nPlease provide the following metadata for your EPUB (press Enter to use default value):")
+    if interactive:
+        print("\nPlease provide the following metadata for your EPUB (press Enter to use default value):")
     
     fields = {
         "dc:title": ("Title", metadata.get("dc:title", "Untitled Document")),
@@ -40,7 +58,7 @@ def get_metadata_from_user(existing_metadata: Optional[Dict] = None) -> Dict:
     
     updated_metadata = {}
     for key, (prompt, default) in fields.items():
-        value = get_user_input(prompt, default)
+        value = get_user_input(prompt, default) if interactive else default
         updated_metadata[key] = value
         
     return {
@@ -50,9 +68,53 @@ def get_metadata_from_user(existing_metadata: Optional[Dict] = None) -> Dict:
         "cover_image": existing_metadata.get("cover_image", None)
     }
 
-def review_markdown(markdown_path: Path) -> tuple[bool, str]:
+
+_PLACEHOLDER_TITLE = frozenset({"", "Untitled Document", "Untitled"})
+_PLACEHOLDER_CREATOR = frozenset({"", "Unknown Author", "Unknown"})
+
+
+def infer_epub_metadata(work_dir: Path, data: dict) -> dict:
+    """Fill generic dc:* fields from markdown headings or the folder name."""
+    meta = dict(data.get("metadata") or {})
+    need_title = meta.get("dc:title", "Untitled Document") in _PLACEHOLDER_TITLE
+    need_creator = meta.get("dc:creator", "Unknown Author") in _PLACEHOLDER_CREATOR
+    if not (need_title or need_creator):
+        return data
+
+    skip = {"icindekiler", "önsöz", "onsöz", "içindekiler"}
+    headings: list[str] = []
+    for md in sorted(work_dir.glob("*.md")):
+        for line in md.read_text(encoding="utf-8").splitlines()[:50]:
+            m = re.match(r"^#\s+(.+?)\s*$", line.strip())
+            if not m:
+                continue
+            t = m.group(1).strip("*")
+            if _slug := re.sub(r"\s+", " ", t):
+                if _slug.casefold() not in skip and len(_slug) > 1:
+                    headings.append(_slug)
+        if headings:
+            break
+
+    if need_title:
+        meta["dc:title"] = (
+            f"{headings[0]} – {headings[1]}" if len(headings) >= 2 else headings[0]
+            if headings else work_dir.name
+        )
+    if need_creator and headings:
+        meta["dc:creator"] = headings[0]
+    if meta.get("dc:language") == "en" and re.search(r"[İığüşöçĞÜŞÖÇ]", work_dir.name + meta.get("dc:title", "")):
+        meta["dc:language"] = "tr"
+    return {**data, "metadata": meta}
+
+
+# @end MD-EPUB-META
+
+# @start MD-EPUB-REVIEW
+def review_markdown(markdown_path: Path, interactive: bool = True) -> tuple[bool, str]:
     """Ask user if they want to review the markdown file."""
     content = markdown_path.read_text(encoding='utf-8')
+    if not interactive:
+        return True, content
     
     while True:
         response = input("\nWould you like to review the markdown file before conversion? (y/n): ").lower()
@@ -80,6 +142,7 @@ def review_markdown(markdown_path: Path) -> tuple[bool, str]:
             return True, content
         else:
             print("Please enter 'y' or 'n'")
+# @end MD-EPUB-REVIEW
 
 def build_image_lookup(images_dir: Path) -> dict:
     """Build a {lowercase_name: actual_path} map for O(1) case-insensitive lookups."""
@@ -91,27 +154,45 @@ def build_image_lookup(images_dir: Path) -> dict:
         pass
     return lookup
 
-def process_markdown_for_images(markdown_text: str, work_dir: Path) -> tuple[str, list[str]]:
-    """Process markdown content to find image references."""
-    image_pattern = r'!\[(.*?)\]\((.*?)\)'
-    images_found = []
-    modified_text = markdown_text
-    images_dir = work_dir / 'images'
+# @start MD-EPUB-IMG
+MIN_IMAGE_WIDTH = 200
+MIN_IMAGE_HEIGHT = 200
+MIN_IMAGE_AREA = 100_000
+
+
+def process_markdown_for_images(
+    markdown_text: str,
+    work_dir: Path,
+    min_width: int = MIN_IMAGE_WIDTH,
+    min_height: int = MIN_IMAGE_HEIGHT,
+    min_area: int = MIN_IMAGE_AREA,
+) -> tuple[str, list[str]]:
+    """Rewrite surviving image references and drop small/decorative image artifacts."""
+    images_found: list[str] = []
+    images_dir = work_dir / "images"
     lookup = build_image_lookup(images_dir)
 
-    for match in re.finditer(image_pattern, markdown_text):
+    def _replace(match: re.Match) -> str:
         alt_text, image_path = match.groups()
-        img_path = Path(image_path.strip())
-
-        actual = lookup.get(img_path.name.lower())
-        if actual is not None:
+        img_name = Path(image_path.strip()).name
+        actual = lookup.get(img_name.lower())
+        if actual is None:
+            print(f"Warning: Image not found: {images_dir / img_name}")
+            return ""
+        with Image.open(actual) as img:
+            w, h = img.size
+            if w < min_width or h < min_height or w * h < min_area:
+                return ""
+            dark_px = sum(img.convert("L").histogram()[:200])
+            if 0 < dark_px < 5_000 and dark_px / (w * h) < 0.005:
+                return ""
+        if actual.name not in images_found:
             images_found.append(actual.name)
-            new_ref = f'![{alt_text}](images/{actual.name})'
-            modified_text = modified_text.replace(match.group(0), new_ref)
-        else:
-            print(f"Warning: Image not found: {images_dir / img_path.name}")
+        return f"![{alt_text}](images/{actual.name})"
 
+    modified_text = re.sub(r"!\[(.*?)\]\((.*?)\)", _replace, markdown_text)
     return modified_text, images_found
+# @end MD-EPUB-IMG
 
 def copy_and_optimize_image(src_path: Path, dest_path: Path, max_dimension: int = 1800) -> None:
     """Copy image to destination path with optimization for EPUB."""
@@ -170,7 +251,7 @@ def get_all_filenames(the_dir, extensions=[]):
     all_files = [x for x in all_files if x.split(".")[-1] in extensions]
     return all_files
 
-def get_packageOPF_XML(md_filenames=[], image_filenames=[], css_filenames=[], description_data=None):
+def get_packageOPF_XML(md_filenames=[], image_filenames=[], css_filenames=[], description_data=None, toc_href=None, spine_filenames: Optional[list[str]] = None):
     doc = minidom.Document()
 
     package = doc.createElement('package')
@@ -225,11 +306,16 @@ def get_packageOPF_XML(md_filenames=[], image_filenames=[], css_filenames=[], de
     x.setAttribute('media-type',"application/xhtml+xml")
     manifest.appendChild(x)
 
-    for i,md_filename in enumerate(md_filenames):
+    resolved_spines = (
+        spine_filenames
+        if spine_filenames is not None
+        else ["s{:05d}-{}.xhtml".format(i, fn.split(".")[0]) for i, fn in enumerate(md_filenames)]
+    )
+    for i, spine_fn in enumerate(resolved_spines):
         x = doc.createElement('item')
-        x.setAttribute('id',"s{:05d}".format(i))
-        x.setAttribute('href', quote("s{:05d}-{}.xhtml".format(i, md_filename.split(".")[0])))
-        x.setAttribute('media-type',"application/xhtml+xml")
+        x.setAttribute('id', "s{:05d}".format(i))
+        x.setAttribute('href', quote(spine_fn))
+        x.setAttribute('media-type', "application/xhtml+xml")
         manifest.appendChild(x)
 
     for i,image_filename in enumerate(image_filenames):
@@ -269,10 +355,10 @@ def get_packageOPF_XML(md_filenames=[], image_filenames=[], css_filenames=[], de
     x.setAttribute('idref',"titlepage")
     x.setAttribute('linear',"yes")
     spine.appendChild(x)
-    for i,_ in enumerate(md_filenames):
+    for i, _ in enumerate(resolved_spines):
         x = doc.createElement('itemref')
-        x.setAttribute('idref',"s{:05d}".format(i))
-        x.setAttribute('linear',"yes")
+        x.setAttribute('idref', "s{:05d}".format(i))
+        x.setAttribute('linear', "yes")
         spine.appendChild(x)
 
     guide = doc.createElement('guide')
@@ -281,6 +367,12 @@ def get_packageOPF_XML(md_filenames=[], image_filenames=[], css_filenames=[], de
     x.setAttribute('title',"Cover image")
     x.setAttribute('href',"titlepage.xhtml")
     guide.appendChild(x)
+    if toc_href:
+        x = doc.createElement('reference')
+        x.setAttribute('type', "toc")
+        x.setAttribute('title', "İçindekiler")
+        x.setAttribute('href', toc_href)
+        guide.appendChild(x)
 
 
     package.appendChild(metadata)
@@ -344,47 +436,78 @@ p {{
 </body>
 </html>"""
 
-def get_TOC_XML(default_css_filenames, markdown_filenames):
+def _nav_html(nodes: list[dict]) -> str:
+    if not nodes:
+        return ""
+    parts = ['<ol>']
+    for node in nodes:
+        label = xml_escape(node["title"])
+        body = f'<a href="{xml_escape(node["href"])}">{label}</a>' if node["href"] else f"<span>{label}</span>"
+        parts.append(f"<li>{body}{_nav_html(node['children'])}</li>")
+    parts.append("</ol>")
+    return "".join(parts)
+
+
+def _first_href(node: dict) -> str:
+    if node.get("href"):
+        return node["href"]
+    for ch in node.get("children", []):
+        if h := _first_href(ch):
+            return h
+    return ""
+
+
+def _nav_ncx(nodes: list[dict], order: list[int]) -> str:
+    chunks = []
+    for node in nodes:
+        resolved_src = _first_href(node)
+        if not resolved_src:
+            continue
+        play = order[0]
+        order[0] += 1
+        label = xml_escape(node["title"])
+        src = xml_escape(resolved_src)
+        chunks.append(
+            f'<navPoint id="navpoint-{play}" playOrder="{play}">'
+            f"<navLabel><text>{label}</text></navLabel>"
+            f'<content src="{src}"/>'
+            f"{_nav_ncx(node['children'], order)}</navPoint>"
+        )
+    return "".join(chunks)
+
+
+def get_TOC_XML(default_css_filenames, nav_entries: list[TocEntry]):
     ## Returns the XML data for the TOC.xhtml file
 
     toc_xhtml = """<?xml version="1.0" encoding="UTF-8"?>\n"""
-    toc_xhtml += """<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">\n"""
+    toc_xhtml += """<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="tr">\n"""
     toc_xhtml += """<head>\n<meta http-equiv="default-style" content="text/html; charset=utf-8"/>\n"""
-    toc_xhtml += """<title>Contents</title>\n"""
+    toc_xhtml += """<title>İçindekiler</title>\n"""
 
     for css_filename in default_css_filenames:
         toc_xhtml += """<link rel="stylesheet" href="css/{}" type="text/css"/>\n""".format(css_filename)
 
     toc_xhtml += """</head>\n<body>\n"""
-    toc_xhtml += """<nav epub:type="toc" role="doc-toc" id="toc">\n<h2>Contents</h2>\n<ol epub:type="list">"""
-    for i,md_filename in enumerate(markdown_filenames):
-        stem = md_filename.split(".")[0]
-        href = quote("s{:05d}-{}.xhtml".format(i, stem))
-        toc_xhtml += """<li><a href="{}">{}</a></li>""".format(href, xml_escape(stem))
-    toc_xhtml += """</ol>\n</nav>\n</body>\n</html>"""
+    toc_xhtml += """<nav epub:type="toc" role="doc-toc" id="toc">\n<h2>İçindekiler</h2>\n"""
+    toc_xhtml += _nav_html(nest_entries(nav_entries))
+    toc_xhtml += """</nav>\n</body>\n</html>"""
 
     return toc_xhtml
 
-def get_TOCNCX_XML(markdown_filenames, uid="", title=""):
+def get_TOCNCX_XML(nav_entries: list[TocEntry], uid="", title=""):
     ## Returns the XML data for the TOC.ncx file
 
     toc_ncx = """<?xml version="1.0" encoding="UTF-8"?>\n"""
-    toc_ncx += """<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" xml:lang="en" version="2005-1">\n"""
+    toc_ncx += """<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" xml:lang="tr" version="2005-1">\n"""
     toc_ncx += """<head>\n"""
     toc_ncx += """<meta name="dtb:uid" content="{}"/>\n""".format(xml_escape(uid))
-    toc_ncx += """<meta name="dtb:depth" content="1"/>\n"""
+    toc_ncx += """<meta name="dtb:depth" content="2"/>\n"""
     toc_ncx += """<meta name="dtb:totalPageCount" content="0"/>\n"""
     toc_ncx += """<meta name="dtb:maxPageNumber" content="0"/>\n"""
     toc_ncx += """</head>\n"""
     toc_ncx += """<docTitle><text>{}</text></docTitle>\n""".format(xml_escape(title))
     toc_ncx += """<navMap>\n"""
-    for i,md_filename in enumerate(markdown_filenames):
-        stem = md_filename.split(".")[0]
-        src = quote("s{:05d}-{}.xhtml".format(i, stem))
-        toc_ncx += """<navPoint id="navpoint-{}" playOrder="{}">\n""".format(i, i + 1)
-        toc_ncx += """<navLabel>\n<text>{}</text>\n</navLabel>""".format(xml_escape(stem))
-        toc_ncx += """<content src="{}"/>""".format(src)
-        toc_ncx += """ </navPoint>"""
+    toc_ncx += _nav_ncx(nest_entries(nav_entries), [1])
     toc_ncx += """</navMap>\n</ncx>"""
 
     return toc_ncx
@@ -434,43 +557,79 @@ def convert_math_to_mathml(html_text: str) -> str:
 
     return masked
 
-def get_chapter_XML(work_dir: str, md_filename: str, css_filenames: list[str], content: Optional[str] = None) -> tuple[str, list[str]]:
-    """
-    Convert markdown chapter to XHTML and process images.
-    Returns tuple of (XHTML content, list of images referenced in chapter)
-    
-    Args:
-        work_dir: Working directory containing markdown files
-        md_filename: Name of markdown file
-        css_filenames: List of CSS files to include
-        content: Optional pre-loaded markdown content. If None, content is read from file
-    """
-    work_dir_path = Path(work_dir)
-    
-    if content is None:
-        with open(work_dir_path / md_filename, "r", encoding="utf-8") as f:
-            markdown_data = f.read()
-    else:
-        markdown_data = content
-    
-    # Process markdown for images and get list of referenced images
-    markdown_data, chapter_images = process_markdown_for_images(markdown_data, work_dir_path)
-    
-    # Convert to HTML
-    html_text = markdown.markdown(
-        markdown_data,
-        extensions=["codehilite", "tables", "fenced_code", "footnotes"],
-        extension_configs={"codehilite": {"guess_lang": False}}
+class SpineDoc(NamedTuple):
+    filename: str
+    xhtml: str
+
+
+_ANCHOR_ATTR = re.compile(r"\{:\s*#(icindekiler|arka-kapak|ch-\d+)\s*\}")
+_ANY_ID_ATTR = re.compile(r"\{:\s*#([A-Za-z0-9_:-]+)\s*\}")
+_FN_DEF = re.compile(r"(?m)^\[\^([^\]]+)\]:.*(?:\n+(?:[ \t]{2,}|\t).*)*")
+
+
+def _extract_doc_title(markdown_data: str, fallback: str = "Bölüm") -> str:
+    for ln in markdown_data.splitlines():
+        if m := re.match(r"^#{1,6}\s+(.+?)(?:\s*\{:.*?\})?\s*$", ln.strip()):
+            cleaned = re.sub(r"[*_`]+", "", m.group(1)).strip()
+            if cleaned:
+                return cleaned
+    return fallback
+
+
+# @start MD-EPUB-CHAP
+# @start MD-EPUB-CHAP-SAFEHTML
+class _SafeHTMLExtractor(HTMLExtractor):
+    def get_endtag_text(self, tag: str) -> str:
+        start = self.line_offset + self.offset
+        if 0 <= start < len(self.rawdata) and self.rawdata.startswith("</", start):
+            m = std_htmlparser.endendtag.search(self.rawdata, start)
+            if m:
+                return self.rawdata[start : m.end()]
+        return f"</{tag}>"
+
+
+class _SafeHtmlBlockPreprocessor(Preprocessor):
+    def run(self, lines: list[str]) -> list[str]:
+        parser = _SafeHTMLExtractor(self.md)
+        parser.feed("\n".join(lines))
+        while parser.rawdata:
+            prev_len = len(parser.rawdata)
+            parser.lineno = 1
+            parser.offset = 0
+            parser.lineno_start_cache = [0]
+            parser.goahead(False)
+            if len(parser.rawdata) == prev_len:
+                if not parser.cdata_elem:
+                    parser.handle_data(parser.rawdata[0])
+                    parser.rawdata = parser.rawdata[1:]
+                    continue
+                parser.lineno = 1
+                parser.offset = 0
+                parser.lineno_start_cache = [0]
+                break
+        parser.close()
+        return "".join(parser.cleandoc).split("\n")
+# @end MD-EPUB-CHAP-SAFEHTML
+
+
+def _markdown_slice_to_xhtml(
+    markdown_data: str, css_filenames: list[str], doc_title: str = "Bölüm", lang: str = "tr"
+) -> str:
+    md_engine = markdown.Markdown(
+        extensions=["codehilite", "tables", "fenced_code", "footnotes", "attr_list"],
+        extension_configs={"codehilite": {"guess_lang": False}},
     )
-
-    # Convert LaTeX math to MathML for EPUB readers
-    html_text = convert_math_to_mathml(html_text)
-
-    # Generate XHTML wrapper
-    xhtml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xmlns:m="http://www.w3.org/1998/Math/MathML" lang="en">
+    md_engine.preprocessors.register(_SafeHtmlBlockPreprocessor(md_engine), "html_block", 20)
+    raw_html = md_engine.convert(markdown_data)
+    # @start MD-EPUB-FOOT
+    raw_html = upgrade_footnotes_to_epub3(raw_html)
+    # @end MD-EPUB-FOOT
+    html_text = convert_math_to_mathml(raw_html)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xmlns:m="http://www.w3.org/1998/Math/MathML" lang="{xml_escape(lang)}">
 <head>
     <meta http-equiv="default-style" content="text/html; charset=utf-8"/>
+    <title>{xml_escape(doc_title)}</title>
     {''.join(f'<link rel="stylesheet" href="css/{css}" type="text/css" media="all"/>' for css in css_filenames)}
 </head>
 <body>
@@ -478,11 +637,160 @@ def get_chapter_XML(work_dir: str, md_filename: str, css_filenames: list[str], c
 </body>
 </html>"""
 
-    return xhtml, chapter_images
+
+def _prepare_markdown(
+    work_dir_path: Path, md_filename: str, content: Optional[str] = None
+) -> tuple[str, list[str], list[TocEntry]]:
+    raw_md = (work_dir_path / md_filename).read_text(encoding="utf-8") if content is None else content
+    pdf_path = resolve_pdf_path(work_dir_path, md_filename)
+    markdown_data = sanitize_marker_markdown(raw_md)
+    # Link TOC first so images inside İçindekiler are stripped before image collection
+    markdown_data, toc_entries = link_contents(markdown_data)
+    markdown_data, chapter_images = process_markdown_for_images(markdown_data, work_dir_path)
+    # @start MD-EPUB-HEAD
+    markdown_data = normalize_heading_hierarchy(markdown_data, doc_hint=md_filename)
+    # @end MD-EPUB-HEAD
+    # @start PDF-MD-FOOT
+    markdown_data = normalize_footnotes_and_breaks(markdown_data, pdf_path=pdf_path)
+    # @end PDF-MD-FOOT
+    return markdown_data, chapter_images, toc_entries
+
+
+def get_chapter_XML(
+    work_dir: str, md_filename: str, css_filenames: list[str], content: Optional[str] = None
+) -> tuple[str, list[str], list[TocEntry]]:
+    """Convert one Markdown document to XHTML and return (xhtml, images, toc_entries)."""
+    markdown_data, chapter_images, toc_entries = _prepare_markdown(Path(work_dir), md_filename, content)
+    doc_title = _extract_doc_title(markdown_data, Path(md_filename).stem)
+    markdown_data = format_verse_line_numbers(markdown_data)
+    local_toc = [TocEntry(e.title, e.level, e.anchor, f"#{e.anchor}" if e.anchor else "") for e in toc_entries]
+    return _markdown_slice_to_xhtml(markdown_data, css_filenames, doc_title=doc_title), chapter_images, local_toc
+# @end MD-EPUB-CHAP
+
+
+# @start MD-EPUB-DEDUP
+class ContentDuplicationError(Exception):
+    pass
+
+
+_FN_BADGE_STRIP = re.compile(r'<a\b[^>]*\bclass="[^"]*\bfootnote-ref\b[^"]*"[^>]*>[\s\S]*?</a>', re.I)
+_MD_FN_STRIP = re.compile(r"\[\^[^\]]+\]")
+_MD_LINK_UNWRAP = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+_MD_ATTR_STRIP = re.compile(r"\{:[^}]*\}")
+_TAG_STRIP = re.compile(r"<[^>]+>")
+
+
+def _norm_prose(text: str) -> str:
+    s = _FN_BADGE_STRIP.sub("", text)
+    s = _TAG_STRIP.sub("", s)
+    s = _MD_FN_STRIP.sub("", s)
+    s = _MD_LINK_UNWRAP.sub(r"\1", s)
+    s = _MD_ATTR_STRIP.sub("", s)
+    s = std_html.unescape(s).translate(str.maketrans("", "", "*_\\`"))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def verify_no_prose_duplication(markdown_data: str, spines: list[SpineDoc], min_len: int = 50) -> None:
+    """Raise ContentDuplicationError if rendered spines repeat prose paragraphs beyond source counts."""
+    norm_md = _norm_prose(markdown_data)
+    ep_counts: Counter[str] = Counter()
+    html_parser = lxml_html.HTMLParser(encoding="utf-8")
+    for sp in spines:
+        if not sp.xhtml.strip():
+            continue
+        root = lxml_html.fromstring(sp.xhtml.encode("utf-8"), parser=html_parser)
+        for p_el in root.xpath(
+            "//p[not(ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' footnote ') "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' footnotes ')])]"
+        ):
+            norm_p = _norm_prose(lxml_html.tostring(p_el, encoding="unicode"))
+            if len(norm_p) >= min_len:
+                ep_counts[norm_p] += 1
+    offenders = [
+        (para, cnt, norm_md.count(para))
+        for para, cnt in ep_counts.items()
+        if cnt >= 2 and cnt > max(1, norm_md.count(para))
+    ]
+    if offenders:
+        offenders.sort(key=lambda item: (-item[1], -len(item[0])))
+        sample, cnt, src_cnt = offenders[0]
+        raise ContentDuplicationError(
+            f"{len(offenders)} duplicated paragraph(s) detected (max {cnt}x vs {src_cnt}x in source): {sample[:100]!r}"
+        )
+# @end MD-EPUB-DEDUP
+
+
+# @start MD-EPUB-SPLIT
+def render_markdown_spines(
+    work_dir: str | Path,
+    md_filename: str,
+    css_filenames: list[str],
+    content: Optional[str] = None,
+    start_index: int = 0,
+    lang: str = "tr",
+) -> tuple[list[SpineDoc], list[str], list[TocEntry]]:
+    """Partition a Markdown document at chapter anchors into separate XHTML spine documents."""
+    stem = Path(md_filename).stem
+    markdown_data, chapter_images, toc_entries = _prepare_markdown(Path(work_dir), md_filename, content)
+    fn_defs = {m.group(1): m.group(0) for m in _FN_DEF.finditer(markdown_data)}
+    body_md = _FN_DEF.sub("", markdown_data) if fn_defs else markdown_data
+    lines = body_md.splitlines()
+
+    split_points: list[int] = [idx for idx, line in enumerate(lines) if _ANCHOR_ATTR.search(line)]
+    segments: list[list[str]] = []
+    if not split_points:
+        segments.append(lines)
+    else:
+        if split_points[0] > 0 and any(ln.strip() for ln in lines[: split_points[0]]):
+            segments.append(lines[: split_points[0]])
+        for pos, sp in enumerate(split_points):
+            nxt = split_points[pos + 1] if pos + 1 < len(split_points) else len(lines)
+            segments.append(lines[sp:nxt])
+
+    seg_filenames = [f"s{start_index + idx:05d}-{stem}.xhtml" for idx in range(len(segments))]
+    anchor_to_href: dict[str, str] = {}
+    for fn, seg_lines in zip(seg_filenames, segments):
+        q_fn = quote(fn)
+        for ln in seg_lines:
+            for m in _ANY_ID_ATTR.finditer(ln):
+                anchor_to_href[m.group(1)] = q_fn
+
+    def _rewrite_link(m: re.Match) -> str:
+        aid = m.group(1)
+        doc_href = anchor_to_href.get(aid, "")
+        return f"]({doc_href}#{aid})" if doc_href else m.group(0)
+
+    spines: list[SpineDoc] = []
+    rendered_md_parts: list[str] = []
+    for fn, seg_lines in zip(seg_filenames, segments):
+        seg_md = "\n".join(seg_lines) + "\n"
+        seg_md = re.sub(r"\]\(#([A-Za-z0-9_:-]+)\)", _rewrite_link, seg_md)
+        doc_title = _extract_doc_title(seg_md, stem)
+        seg_md = format_verse_line_numbers(seg_md)
+        if fn_defs:
+            used_fns = [fid for fid in re.findall(r"\[\^([^\]]+)\](?!:)", seg_md) if fid in fn_defs]
+            seg_defs = [fn_defs[fid] for fid in dict.fromkeys(used_fns)]
+            if seg_defs:
+                seg_md = seg_md.rstrip() + "\n\n" + "\n\n".join(seg_defs) + "\n"
+        rendered_md_parts.append(seg_md)
+        spines.append(SpineDoc(fn, _markdown_slice_to_xhtml(seg_md, css_filenames, doc_title=doc_title, lang=lang)))
+
+    verify_no_prose_duplication("\n\n".join(rendered_md_parts), spines)
+    resolved_toc = [
+        TocEntry(
+            e.title,
+            e.level,
+            e.anchor,
+            f"{anchor_to_href[e.anchor]}#{e.anchor}" if e.anchor and e.anchor in anchor_to_href else "",
+        )
+        for e in toc_entries
+    ]
+    return spines, chapter_images, resolved_toc
+# @end MD-EPUB-SPLIT
 
 
 
-def convert_to_epub(markdown_dir: Path, output_path: Path) -> None:
+def convert_to_epub(markdown_dir: Path, output_path: Path, interactive: bool = True) -> None:
     """
     Convert markdown files and images to EPUB format.
     """
@@ -494,9 +802,9 @@ def convert_to_epub(markdown_dir: Path, output_path: Path) -> None:
     
     # Generate EPUB file
     epub_path = markdown_dir / f"{markdown_dir.name}.epub"
-    main([str(markdown_dir), str(epub_path)])
+    main([str(markdown_dir), str(epub_path)], interactive=interactive)
 
-def main(args):
+def main(args, interactive: bool = True):
     if len(args) < 2:
         print("\nUsage:\n    python md2epub.py <markdown_directory> <output_file.epub>")
         exit(1)
@@ -515,9 +823,12 @@ def main(args):
         if os.path.exists(description_path):
             with open(description_path, 'r', encoding='utf-8') as f:
                 existing_metadata = json.load(f)
-        
+
+        if not interactive:
+            existing_metadata = infer_epub_metadata(Path(work_dir), existing_metadata)
+
         # Get metadata from user
-        json_data = get_metadata_from_user(existing_metadata)
+        json_data = get_metadata_from_user(existing_metadata, interactive=interactive)
         
         # Find all markdown files if not already in metadata
         if not json_data["chapters"]:
@@ -536,7 +847,7 @@ def main(args):
         chapter_contents = {}
         for chapter in json_data["chapters"]:
             md_path = Path(work_dir) / chapter["markdown"]
-            should_continue, content = review_markdown(md_path)
+            should_continue, content = review_markdown(md_path, interactive=interactive)
             if not should_continue:
                 print("\nConversion aborted by user.")
                 return
@@ -554,32 +865,49 @@ def main(args):
                 all_md_filenames.append(chapter["markdown"])
             if len(chapter["css"]) and (chapter["css"] not in all_css_filenames):
                 all_css_filenames.append(chapter["css"])
-        
-        all_image_filenames = get_all_filenames(images_dir, extensions=["gif", "jpg", "jpeg", "png"])
 
         # First process all chapters and images
         images_dir = Path(work_dir) / 'images'
         epub_images_dir = Path(work_dir) / 'epub_images'
         processed_images = {}  # Store processed image data
         all_referenced_images = set()
-        chapter_data = {}  # Store processed chapter data
+        all_spines: list[SpineDoc] = []
+        nav_entries: list[TocEntry] = []
+        toc_href = None
 
-        # First pass: Process chapters and collect image references
+        # First pass: Process chapters into per-chapter spine documents and collect image references
         print("\nProcessing chapters and collecting image references...")
-        for i, chapter in enumerate(json_data["chapters"]):
+        for chapter in json_data["chapters"]:
             css_files = json_data["default_css"][:]
             if chapter["css"]:
                 css_files.append(chapter["css"])
-                
-            # Process chapter content
-            chapter_xhtml, chapter_images = get_chapter_XML(
-                work_dir, 
-                chapter["markdown"], 
+
+            spines, chapter_images, toc_entries = render_markdown_spines(
+                work_dir,
+                chapter["markdown"],
                 css_files,
-                content=chapter_contents[chapter["markdown"]]
+                content=chapter_contents[chapter["markdown"]],
+                start_index=len(all_spines),
+                lang=json_data["metadata"].get("dc:language", "tr"),
             )
-            chapter_data[chapter["markdown"]] = chapter_xhtml
+            all_spines.extend(spines)
             all_referenced_images.update(chapter_images)
+
+            if toc_entries:
+                ic_doc = next(
+                    (quote(sp.filename) for sp in spines if 'id="icindekiler"' in sp.xhtml),
+                    quote(spines[0].filename),
+                )
+                ic_href = f"{ic_doc}#icindekiler"
+                toc_href = toc_href or ic_href
+                nav_entries.append(TocEntry("İçindekiler", 1, "icindekiler", ic_href))
+                nav_entries.extend(toc_entries)
+            elif spines:
+                stem = Path(chapter["markdown"]).stem
+                nav_entries.append(TocEntry(stem, 1, "", quote(spines[0].filename)))
+
+        if json_data.get("cover_image"):
+            all_referenced_images.add(json_data["cover_image"])
 
         # Process and optimize images
         print("\nProcessing and optimizing images...")
@@ -605,38 +933,56 @@ def main(args):
             import shutil
             shutil.rmtree(epub_images_dir, ignore_errors=True)
 
+        # @start MD-EPUB-PACK
+        # @start XHT-GATE
+        print("\nChecking XHTML...")
+        gated_spines: list[SpineDoc] = []
+        for sp in all_spines:
+            gated_spines.append(SpineDoc(sp.filename, ensure_xhtml(sp.xhtml, f"OPS/{sp.filename}")))
+        verify_no_prose_duplication("\n\n".join(sp.xhtml for sp in all_spines), gated_spines)
+        coverpage_data = ensure_xhtml(get_coverpage_XML(title, authors), "OPS/titlepage.xhtml")
+        toc_xml = ensure_xhtml(
+            get_TOC_XML(json_data["default_css"], nav_entries), "OPS/TOC.xhtml"
+        )
+        ncx_xml = ensure_xml(
+            get_TOCNCX_XML(
+                nav_entries,
+                uid=json_data["metadata"].get("dc:identifier", ""),
+                title=json_data["metadata"].get("dc:title", ""),
+            ),
+            "OPS/toc.ncx",
+        )
+        opf_xml = ensure_xml(
+            get_packageOPF_XML(
+                md_filenames=all_md_filenames,
+                image_filenames=sorted(processed_images.keys()),
+                css_filenames=all_css_filenames,
+                description_data=json_data,
+                toc_href=toc_href,
+                spine_filenames=[sp.filename for sp in gated_spines],
+            ),
+            "OPS/package.opf",
+        )
+        container_xml = ensure_xml(get_container_XML(), "META-INF/container.xml")
+        print(f"XHTML check passed for {len(gated_spines) + 5} document(s).")
+        # @end XHT-GATE
+
         # Now create the EPUB file with all prepared content
         print("\nCreating EPUB file...")
         with zipfile.ZipFile(output_path, "w") as epub:
             # Write mimetype (must be first and uncompressed)
             epub.writestr("mimetype", "application/epub+zip")
 
-            # Write container.xml
-            epub.writestr("META-INF/container.xml", get_container_XML(), zipfile.ZIP_DEFLATED)
+            epub.writestr("META-INF/container.xml", container_xml, zipfile.ZIP_DEFLATED)
+            epub.writestr("OPS/package.opf", opf_xml, zipfile.ZIP_DEFLATED)
+            epub.writestr("OPS/titlepage.xhtml", coverpage_data.encode("utf-8"), zipfile.ZIP_DEFLATED)
 
-            # Write package.opf
-            epub.writestr("OPS/package.opf", 
-                get_packageOPF_XML(
-                    md_filenames=all_md_filenames,
-                    image_filenames=all_image_filenames,
-                    css_filenames=all_css_filenames,
-                    description_data=json_data
-                ), 
-                zipfile.ZIP_DEFLATED
-            )
-
-            # Write cover page
-            coverpage_data = get_coverpage_XML(title, authors)
-            epub.writestr("OPS/titlepage.xhtml", coverpage_data.encode('utf-8'), zipfile.ZIP_DEFLATED)
-
-            # Write processed chapters
-            print("Writing chapters...")
-            for i, chapter in enumerate(json_data["chapters"]):
-                print(f"  Writing chapter {i+1}/{len(json_data['chapters'])}: {chapter['markdown']}")
+            print(f"Writing {len(gated_spines)} spine chapters...")
+            for sp in gated_spines:
                 epub.writestr(
-                    f"OPS/s{i:05d}-{chapter['markdown'].split('.')[0]}.xhtml",
-                    chapter_data[chapter["markdown"]].encode('utf-8'),
-                    zipfile.ZIP_DEFLATED
+                    f"OPS/{sp.filename}",
+                    sp.xhtml.encode("utf-8"),
+                    zipfile.ZIP_DEFLATED,
                 )
 
             # Write processed images
@@ -645,35 +991,31 @@ def main(args):
                 for image_name, image_data in processed_images.items():
                     epub.writestr(f"OPS/images/{image_name}", image_data, zipfile.ZIP_DEFLATED)
 
-            # Write TOC files
             print("Writing table of contents...")
-            epub.writestr("OPS/TOC.xhtml", 
-                get_TOC_XML(json_data["default_css"], all_md_filenames),
-                zipfile.ZIP_DEFLATED
-            )
-            
-            epub.writestr("OPS/toc.ncx",
-                get_TOCNCX_XML(
-                    all_md_filenames,
-                    uid=json_data["metadata"].get("dc:identifier", ""),
-                    title=json_data["metadata"].get("dc:title", "")
-                ),
-                zipfile.ZIP_DEFLATED
-            )
-
-            # Copy remaining images that weren't referenced in markdown
-            remaining_images = set(all_image_filenames) - set(processed_images.keys())
-            if remaining_images and os.path.exists(images_dir):
-                print(f"Writing {len(remaining_images)} additional images...")
-                for image in remaining_images:
-                    with open(os.path.join(images_dir, image), "rb") as f:
-                        epub.writestr(f"OPS/images/{image}", f.read(), zipfile.ZIP_DEFLATED)
+            epub.writestr("OPS/TOC.xhtml", toc_xml, zipfile.ZIP_DEFLATED)
+            epub.writestr("OPS/toc.ncx", ncx_xml, zipfile.ZIP_DEFLATED)
 
             # Copy CSS files; write a default style.css for any that are missing
             default_css_content = b"""body { font-family: serif; line-height: 1.5; margin: 5%; }
 h1, h2, h3, h4, h5, h6 { font-family: sans-serif; }
+h1 { font-size: 1.6em; margin-top: 1.2em; }
+h2 { font-size: 1.35em; margin-top: 1em; }
+h3, h4 { font-size: 1.2em; margin-top: 0.8em; }
+#icindekiler table { border-collapse: collapse; width: 100%; margin: 0.5em 0; }
+#icindekiler td, #icindekiler th { padding: 0.2em 0.5em; vertical-align: top; }
 img { max-width: 100%; height: auto; }
 pre, code { font-family: monospace; font-size: 0.9em; }
+p.verse { display: table; width: 100%; table-layout: fixed; margin: 0.35em 0; border: 0; }
+.verse-ln { display: table-cell; width: 2.75em; padding-right: 0.6em; text-align: right; vertical-align: top; font-size: 0.82em; color: #555; font-variant-numeric: tabular-nums; }
+.verse-ln-empty { visibility: hidden; }
+.verse-body { display: table-cell; vertical-align: top; }
+a.footnote-ref { text-decoration: none; font-size: 0.8em; vertical-align: super; line-height: 0; }
+a.footnote-ref sup { font-size: 1em; vertical-align: baseline; }
+section.footnotes { margin-top: 2em; font-size: 0.86em; line-height: 1.4; color: #333; }
+section.footnotes hr { border: 0; border-top: 1px solid #bbb; width: 35%; margin: 0 0 0.8em 0; }
+aside.footnote { margin: 0.45em 0; }
+aside.footnote p { margin: 0.2em 0; }
+a.footnote-num, a.footnote-backref { text-decoration: none; color: #555; }
 """
             print(f"Writing {len(all_css_filenames)} CSS files...")
             for css in all_css_filenames:
@@ -685,6 +1027,7 @@ pre, code { font-family: monospace; font-size: 0.9em; }
                     epub.writestr(f"OPS/css/{css}", default_css_content, zipfile.ZIP_DEFLATED)
 
         print(f"\nEPUB creation complete: {output_path}")
+        # @end MD-EPUB-PACK
         
     except Exception:
         import traceback
